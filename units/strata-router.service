@@ -1,0 +1,14 @@
+[Unit]
+Description=Strata single-port on-demand router (Hermes provider Local-Strata @8098)
+# 纯转发代理：常驻、不占 GPU；引擎单元 strata-swift-iq3s 由它首请求时按需 start
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/ubuntu/.local/bin/ninfer-router --profile strata
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

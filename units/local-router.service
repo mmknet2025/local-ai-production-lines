@@ -1,0 +1,15 @@
+[Unit]
+Description=Local engines unified on-demand router (Hermes provider local-engines @8097)
+# 纯转发编排：常驻、不占 GPU。三个互斥引擎由它首请求时按需 start，
+# 切换模型时先 stop 当前引擎再拉起目标；冷启动经 SSE 注入状态提示。
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/ubuntu/.local/bin/ninfer-router --profile all
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

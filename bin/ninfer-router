@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""ninfer-router —— 单端口聚合本地推理端点，并可按需拉起对应引擎。
+
+用途：Hermes 的 provider 是「一个 base_url 对应一个模型清单」，无法逐模型走不同端口。
+本进程在**一个端口**上暴露 `/v1/models`（列全部本地模型）并按请求体的 `model` 字段把
+`/v1/chat/completions` 等转发到各自端口的引擎实例 —— 于是 Hermes 侧只需**一条
+provider + 多个模型**。
+
+支持四个 profile（--profile，默认 ninfer；端口/启动方式各自独立）：
+
+  ninfer  @8099（NInfer，引擎由本路由拉成 transient 单元）
+      1card-qwen3.8-27b-swift-iq3s -> 127.0.0.1:8090  Qwen3.8-27B Swift IQ3_S（单卡 KVMem）
+      2card-qwen3.8-27b-coder390  -> 127.0.0.1:8091  Qwen3.8-27B Coder390（双卡 TP2）
+
+  strata  @8098（Strata，引擎是**持久单元** strata-swift-iq3s，本路由只 start 它）
+      flash-next-swift1.5-iq3s     -> 127.0.0.1:8080  Qwen3.8-Flash-Next 125B IQ3_S
+
+  all     @8097（**统一编排**：合并全部三个模型；拉起目标前先停掉其它引擎——三引擎互斥。
+           冷启动且客户端走流式时，先注入「⏳ 正在拉起 X…」提示，就绪后同轮转发原回答）
+
+并且：**目标引擎没起就自动拉起**，等就绪再转发。
+代价：冷启动后的**第一个请求会阻塞到引擎 ready**（NInfer ≈10s；Strata 加载 ~48G，约 1–2 分钟；
+all profile 切换若涉及 Strata 卸载，另加停机等待）。
+
+约定：
+  * `/v1/models` 返回**静态**清单（引擎没起也稳定显示），`meta.upstream_up` 标在线态。
+  * `/health` 报 `up` / `starting`（单元在跑但端口未开）/ `down`。
+  * 拉起前做**内存闸门**（min_mem_gib），MemAvailable 不够就拒绝，防 cgroup OOM 连带杀桌面。
+  * 流式（SSE）原样透传；上游无 Content-Length 时改用 chunked 回给客户端。
+
+CLI：
+  ninfer-router [--profile ninfer|strata]   前台运行（通常由 systemd 托管）
+  ninfer-router --check                     打印每个模型的端口/单元状态
+  ninfer-router --start MODEL               只拉起某个引擎（不起服务）
+  ninfer-router --stop  MODEL               停掉某个引擎
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ----------------------------------------------------------------- NInfer 线
+# 5258 线（swift15 自编，v3 reader）
+NINFER_BIN = os.path.expanduser(
+    "~/ninfer-build/src-5258/swift15/engine/build/apps/ninfer-serve")
+SWIFT_DIR = os.path.expanduser("~/models/qwen3.8-27b-swift")
+SWIFT_LOG = os.path.join(SWIFT_DIR, "prod.log")
+# TP2 线（BaiYouQing fork，v2-only reader）
+TP2_BIN = os.path.expanduser("~/ninfer-build/baiyouqing-tp2/build-linux/apps/ninfer-serve")
+TP2_MODEL = os.path.expanduser(
+    "~/models/qwen3.8-27b-coder390/qwen3_8_27b_coder390_w4a4w8a8.ninfer")
+TP2_LOG = os.path.expanduser("~/ninfer-build/tp2-prod.log")
+
+NINFER_ROUTES = {
+    "1card-qwen3.8-27b-swift-iq3s": {
+        "port": 8090, "ctx": 262144, "unit": "ninfer-prod",
+        "start_via": "transient",
+        "upstream_model": "qwen3.8-27b",
+        "log": SWIFT_LOG, "ready_s": 240, "min_mem_gib": 40,
+        "start": ["/bin/bash", "-c", (
+            f"cd {SWIFT_DIR} && CUDA_VISIBLE_DEVICES=0 PORT=8090 exec ./start-prod.sh "
+            f"> {SWIFT_LOG} 2>&1")],
+    },
+    "2card-qwen3.8-27b-coder390": {
+        "port": 8091, "ctx": 262144, "unit": "ninfer-tp2",
+        "start_via": "transient",
+        "upstream_model": "qwen3.8-27b-coder390-tp2",
+        "log": TP2_LOG, "ready_s": 180, "min_mem_gib": 0,
+        "start": ["/bin/bash", "-c", (
+            f"exec {TP2_BIN} {TP2_MODEL} --tp 2 --devices 0,1 --host 127.0.0.1 --port 8091 "
+            f"--model-id qwen3.8-27b-coder390-tp2 --max-context 262144 --kv-capacity 262144 "
+            f"--prefill-chunk 1024 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft "
+            f"--max-concurrency 1 --default-max-tokens 32768 --structured-output > {TP2_LOG} 2>&1")],
+    },
+}
+
+# ----------------------------------------------------------------- Strata 线
+# 引擎是持久单元 strata-swift-iq3s（未 enable，按需 start）；~48G RAM，与 NInfer 互斥
+STRATA_ROUTES = {
+    "flash-next-swift1.5-iq3s": {
+        "port": 8080, "ctx": 262144, "unit": "strata-swift-iq3s",
+        "start_via": "unit",
+        "upstream_model": "flash-next-swift1.5-iq3s",
+        "log": None,  # 持久单元日志走 journalctl
+        "ready_s": 300, "min_mem_gib": 48,
+    },
+}
+
+PROFILES = {
+    "ninfer": {"routes": NINFER_ROUTES, "port": 8099, "name": "ninfer-router"},
+    "strata": {"routes": STRATA_ROUTES, "port": 8098, "name": "strata-router"},
+    "all": {"routes": None, "port": 8097, "name": "local-router"},  # 合并路由在 main 组装
+}
+
+_STRIP_REQ = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+              "te", "trailers", "transfer-encoding", "upgrade", "host",
+              "content-length", "accept-encoding"}
+_STRIP_RESP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+               "te", "trailers", "transfer-encoding", "upgrade", "content-length"}
+CHUNK = 64 * 1024
+
+# 由 main() 按 --profile 注入
+ROUTES = NINFER_ROUTES
+SERVER_NAME = "ninfer-router"
+EXCLUSIVE = False          # True = all profile：拉起前先停掉其它引擎
+
+
+# ------------------------------------------------------------------ helpers
+def port_up(port: int) -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.35)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def unit_active(unit: str) -> bool:
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit],
+                          capture_output=True).returncode == 0
+
+
+def log_tail(cfg: dict, n: int = 8) -> str:
+    path = cfg.get("log")
+    if path:
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 4096))
+                return "\n".join(f.read().decode("utf-8", "replace").splitlines()[-n:])
+        except OSError:
+            return "(no log)"
+    # 持久单元：从 journal 取尾部
+    r = subprocess.run(["journalctl", "--user", "-u", cfg["unit"], "--no-pager",
+                        f"-n{n}"], capture_output=True, text=True)
+    return r.stdout.strip() or "(no journal)"
+
+
+def mem_available_gib() -> float:
+    for ln in open("/proc/meminfo"):
+        if ln.startswith("MemAvailable"):
+            return int(ln.split()[1]) / 1048576
+    return 0.0
+
+
+def stop_others(model: str) -> list[str]:
+    """停掉除目标外所有**在跑**的引擎单元（三引擎互斥）。返回被停的模型名列表。"""
+    stopped = []
+    for m, c in ROUTES.items():
+        if m != model and (unit_active(c["unit"]) or port_up(c["port"])):
+            subprocess.run(["systemctl", "--user", "stop", c["unit"]],
+                           check=False, capture_output=True)
+            stopped.append(m)
+    # Strata 卸载要释放几十 G page-locked RAM，等它真 inactive 再起新的
+    for m in stopped:
+        c = ROUTES[m]
+        dl = time.time() + 180
+        while unit_active(c["unit"]) and time.time() < dl:
+            time.sleep(1)
+    return stopped
+
+
+def start_engine(model: str, exclusive: bool = False) -> tuple[bool, str, list[str]]:
+    """拉起某模型的引擎并等它就绪。返回 (是否就绪, 说明, 被停掉的模型列表)。"""
+    cfg = ROUTES[model]
+    stopped: list[str] = []
+    if port_up(cfg["port"]):
+        return True, "already up", stopped
+    if cfg["min_mem_gib"]:
+        avail = mem_available_gib()
+        if avail < cfg["min_mem_gib"] and not exclusive:
+            return False, (f"拒绝拉起：MemAvailable {avail:.1f} GiB < 闸门 "
+                           f"{cfg['min_mem_gib']} GiB（硬起会被 cgroup OOM 连带杀桌面进程；"
+                           f"本地引擎互斥，请先停掉另一个）"), stopped
+    if exclusive:
+        stopped = stop_others(model)
+    # 停掉其它引擎后重新评估内存（闸门此时应能通过）
+    if cfg["min_mem_gib"]:
+        avail = mem_available_gib()
+        if avail < cfg["min_mem_gib"]:
+            return False, (f"拒绝拉起：MemAvailable {avail:.1f} GiB 仍 < 闸门 "
+                           f"{cfg['min_mem_gib']} GiB"), stopped
+    if cfg["start_via"] == "transient":
+        # NInfer：拉成脱离本路由存活的 transient 单元
+        if not unit_active(cfg["unit"]):
+            subprocess.run(["systemd-run", "--user", "--collect", f"--unit={cfg['unit']}",
+                            "--property=MemoryAccounting=yes",
+                            "--property=MemoryMax=infinity",
+                            *cfg["start"]], check=False, capture_output=True)
+    else:
+        # Strata：持久单元，未 enable，只 start
+        if not unit_active(cfg["unit"]):
+            subprocess.run(["systemctl", "--user", "start", cfg["unit"]],
+                           check=False, capture_output=True)
+
+    deadline = time.time() + cfg["ready_s"]
+    while time.time() < deadline:
+        if port_up(cfg["port"]):
+            return True, f"ready（{cfg['ready_s'] - int(deadline - time.time())}s 余量）", stopped
+        if not unit_active(cfg["unit"]):
+            return False, ("引擎单元已退出（多半是显存/内存不够 —— 本地引擎互斥，"
+                           f"另一个可能正占着）\n日志尾部:\n{log_tail(cfg)}"), stopped
+        time.sleep(2)
+    return False, f"{cfg['ready_s']}s 内未就绪\n日志尾部:\n{log_tail(cfg)}", stopped
+
+
+# ------------------------------------------------------------------ HTTP
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"{SERVER_NAME}/2.0"
+
+    def log_message(self, *_a):          # 默认日志太吵，自己打
+        pass
+
+    def _json(self, code: int, obj) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def sse_notice(self, text: str, finish: bool = False) -> None:
+        """注入一条纯状态 SSE delta（作为 assistant content 让客户端立即显示）。"""
+        if not getattr(self, "_sse_head", False):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self._sse_head = True
+        chunk = {"id": f"notice-{int(time.time()*1000)}",
+                 "object": "chat.completion.chunk",
+                 "choices": [{"index": 0,
+                              "delta": {"content": text + "\n\n"},
+                              "finish_reason": "stop" if finish else None}]}
+        payload = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+        self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+        self.wfile.flush()
+        if finish:
+            done = b"data: [DONE]\n\n"
+            self.wfile.write(f"{len(done):x}\r\n".encode() + done + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+    def _models(self):
+        return [{"id": mid, "object": "model", "owned_by": SERVER_NAME,
+                 "context_window": cfg["ctx"], "max_model_len": cfg["ctx"],
+                 "meta": {"upstream_port": cfg["port"],
+                          "upstream_model": cfg["upstream_model"],
+                          "upstream_up": port_up(cfg["port"])}}
+                for mid, cfg in ROUTES.items()]
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path in ("/v1/models", "/models"):
+            return self._json(200, {"object": "list", "data": self._models()})
+        if path in ("/health", "/v1/health"):
+            return self._json(200, {"status": "ok", "upstreams": {
+                m: ("up" if port_up(c["port"]) else
+                    ("starting" if unit_active(c["unit"]) else "down"))
+                for m, c in ROUTES.items()}})
+        return self._json(404, {"error": {"message": f"{SERVER_NAME}: no route for GET {path}",
+                                          "type": "not_found"}})
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        try:
+            req = json.loads(raw) if raw else {}
+        except Exception:
+            return self._json(400, {"error": {"message": f"{SERVER_NAME}: body is not JSON",
+                                              "type": "invalid_request_error"}})
+
+        model = req.get("model")
+        cfg = ROUTES.get(model)
+        if cfg is None:
+            return self._json(404, {"error": {
+                "message": f"{SERVER_NAME}: unknown model {model!r}; known: {sorted(ROUTES)}",
+                "type": "not_found"}})
+
+        # 客户端 id → 引擎自己的 --model-id（引擎只认自己的名字）
+        if req.get("model") != cfg["upstream_model"]:
+            req["model"] = cfg["upstream_model"]
+            raw = json.dumps(req, ensure_ascii=False).encode()
+
+        port = cfg["port"]
+        t0 = time.time()
+        exclusive = EXCLUSIVE                       # all profile：拉起前先杀别的引擎
+        is_stream = bool(req.get("stream"))
+        tag = ""
+        cold = not port_up(port)
+        if cold:                                    # ← 按需拉起（可能含互斥切换）
+            # 流式：先给客户端一个可立即显示的状态 delta，避免长时间空白
+            notice_sent = False
+            if is_stream:
+                stop_note = ("（先停掉当前模型…）" if any(
+                    unit_active(ROUTES[m]["unit"]) or port_up(ROUTES[m]["port"])
+                    for m in ROUTES if m != model) else "")
+                self.sse_notice(f"⏳ 正在后台拉起 {model} {stop_note}，就绪后自动回答…")
+                notice_sent = True
+
+            ok, why, stopped = start_engine(model, exclusive=exclusive)
+            if not ok:
+                if notice_sent:
+                    self.sse_notice(f"❌ {model} 拉起失败：{why}", finish=True)
+                else:
+                    return self._json(503, {"error": {
+                        "message": f"{SERVER_NAME}: 引擎 {cfg['unit']} 拉起失败：{why}",
+                        "type": "upstream_start_failed", "upstream_port": port}})
+                sys.stderr.write(f"  {model} 拉起失败：{why}\n")
+                return
+            if notice_sent:
+                switch = f"（已停 {', '.join(stopped)}）" if stopped else ""
+                self.sse_notice(f"✅ {model} 就绪{switch}（耗时 {time.time()-t0:.0f}s），回答中…")
+            tag = f"  (cold-start {time.time()-t0:.1f}s"
+            if stopped:
+                tag += f", stopped {','.join(stopped)}"
+            tag += ")"
+
+        hdrs = {k: v for k, v in self.headers.items() if k.lower() not in _STRIP_REQ}
+        hdrs["Content-Type"] = self.headers.get("Content-Type", "application/json")
+
+        # 端口开了但引擎可能仍在 warmup（返回 503 model_loading）→ 等它就绪再转发
+        ready_deadline = time.time() + 120
+        while True:
+            up = urllib.request.Request(f"http://127.0.0.1:{port}{self.path}",
+                                        data=raw, headers=hdrs, method="POST")
+            try:
+                resp = urllib.request.urlopen(up, timeout=1800)
+                break
+            except urllib.error.HTTPError as e:                  # 上游 4xx/5xx
+                body = e.read()
+                if e.code == 503 and b"model_loading" in body and time.time() < ready_deadline:
+                    time.sleep(2)
+                    continue
+                self.send_response(e.code)
+                for k, v in e.headers.items():
+                    if k.lower() not in _STRIP_RESP:
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                sys.stderr.write(f"  {model} -> :{port}  {e.code}{tag}  {time.time()-t0:.2f}s\n")
+                return
+            except Exception as e:
+                return self._json(502, {"error": {
+                    "message": f"{SERVER_NAME}: upstream :{port} failed: {e}",
+                    "type": "upstream_error"}})
+
+        clen = resp.headers.get("Content-Length")
+        if getattr(self, "_sse_head", False):
+            # 冷启动状态已以 SSE 开头发给客户端：响应头不再重发，只把上游 body 原样接续
+            chunked = True
+        else:
+            chunked = clen is None
+            self.send_response(resp.status)
+            for k, v in resp.headers.items():
+                if k.lower() not in _STRIP_RESP:
+                    self.send_header(k, v)
+            if chunked:
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Content-Length", clen)
+            self.end_headers()
+
+        while True:
+            buf = resp.read(CHUNK)
+            if not buf:
+                break
+            if chunked:
+                self.wfile.write(f"{len(buf):x}\r\n".encode() + buf + b"\r\n")
+            else:
+                self.wfile.write(buf)
+            self.wfile.flush()
+        if chunked:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        sys.stderr.write(f"  {model} -> :{port}  {resp.status}{tag}  {time.time()-t0:.2f}s"
+                         f"{'  (stream)' if chunked else ''}\n")
+
+
+# ------------------------------------------------------------------ main
+def main() -> int:
+    global ROUTES, SERVER_NAME, EXCLUSIVE
+
+    ap = argparse.ArgumentParser(
+        description="single-port aggregator + on-demand starter for local engines")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="ninfer",
+                    help="ninfer=@8099 / strata=@8098 / all=@8097（统一编排，互斥切换）")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=None,
+                    help="覆盖 profile 默认端口")
+    ap.add_argument("--check", action="store_true", help="打印端口/单元状态后退出")
+    ap.add_argument("--start", metavar="MODEL", help="只拉起该模型的引擎")
+    ap.add_argument("--stop", metavar="MODEL", help="停掉该模型的引擎")
+    a = ap.parse_args()
+
+    if a.profile == "all":
+        merged = {**NINFER_ROUTES, **STRATA_ROUTES}
+        PROFILES["all"]["routes"] = merged
+    prof = PROFILES[a.profile]
+    ROUTES = prof["routes"]
+    SERVER_NAME = prof["name"]
+    EXCLUSIVE = (a.profile == "all")
+    port = a.port if a.port is not None else prof["port"]
+
+    if a.start or a.stop:
+        m = a.start or a.stop
+        if m not in ROUTES:
+            print(f"unknown model {m!r}; known: {sorted(ROUTES)}", file=sys.stderr)
+            return 2
+        cfg = ROUTES[m]
+        if a.stop:
+            subprocess.run(["systemctl", "--user", "stop", cfg["unit"]], check=False)
+            print(f"stopped {cfg['unit']}")
+            return 0
+        ok, why, stopped = start_engine(m, exclusive=EXCLUSIVE)
+        print(("✅ " if ok else "❌ ") + f"{m}: {why}"
+              + (f"  (stopped {', '.join(stopped)})" if stopped else ""))
+        return 0 if ok else 1
+
+    if a.check:
+        for m, c in ROUTES.items():
+            state = ("up" if port_up(c["port"]) else
+                     ("starting" if unit_active(c["unit"]) else "DOWN"))
+            print(f"  {m:30} -> 127.0.0.1:{c['port']:<5} unit={c['unit']:<20} {state}")
+        return 0
+
+    srv = ThreadingHTTPServer((a.host, port), Handler)
+    srv.daemon_threads = True
+    sys.stderr.write(f"{SERVER_NAME} listening on http://{a.host}:{port}/v1  "
+                     f"| profile={a.profile} | models: {', '.join(ROUTES)}  "
+                     f"| on-demand start: ON\n")
+    sys.stderr.flush()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

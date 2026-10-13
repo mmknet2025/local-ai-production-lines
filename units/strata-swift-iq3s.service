@@ -1,0 +1,23 @@
+# /home/ubuntu/.config/systemd/user/strata-swift-iq3s.service
+# Strata 引擎持久单元：Strata/Qwen3.8-Flash-Next 125B-A6B Swift IQ3_S @8080
+# 对应 Hermes provider `local-strata`（config.yaml providers.local-strata.api = http://127.0.0.1:8080/v1）
+# 设计：按需启动，未 enable（开机不自启）。启动：systemctl --user start strata-swift-iq3s
+[Unit]
+Description=Strata serve - Qwen3.8-Flash-Next Swift IQ3_S @8080 (Hermes provider local-strata)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/src/Strata
+Environment="STRATA_PREFILL_HELP=1"
+ExecStart=/home/ubuntu/src/Strata/.venv/bin/python /home/ubuntu/src/Strata/serve/server.py --engine strata --config /home/ubuntu/src/Strata/strata-swift-iq3_s.json --port 8080
+# 引擎崩了自愈
+Restart=on-failure
+RestartSec=5
+# 低 RAM 模式（--resident-experts）本机需 ~33GiB 专家驻 RAM：不设 MemoryMax，避免 cgroup OOM 杀进程
+MemoryMax=infinity
+# 权重卸载需要时间，停止超时放宽到 3 分钟
+TimeoutStopUSec=3min
+
+[Install]
+WantedBy=default.target

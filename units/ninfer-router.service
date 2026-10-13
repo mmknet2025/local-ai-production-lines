@@ -1,0 +1,14 @@
+[Unit]
+Description=NInfer single-port router (Hermes provider Local-NInfer @8099)
+# 纯转发代理：常驻、不占 GPU；三个引擎由它按需拉成独立 transient 单元
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/ubuntu/.local/bin/ninfer-router
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
