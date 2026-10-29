@@ -18,6 +18,8 @@ sources:
 
 [[20_Tech_Stack/index|↩️ 返回技术栈首页]]
 
+> [!note] 引擎选型（2026-10-29）：官方 `--tensor-parallel` 实测不换线 —— NVFP4 要 3 处未上游补丁才能加载、修好仍 prefill −50~69%，零补丁路线要换 GGUF 量化件且同样 −50%。数据与根因见 [[20_Tech_Stack/ninfer_dual_card_engine_eval_20261029]]。
+
 # Qwen3.8-27B Coder390 W4A4-W8A8 · NInfer 双卡 TP2 部署手册
 
 > [!success] ✅ 本机生产模型（2026-10-08 起）
@@ -69,18 +71,7 @@ $BIN $MODEL --tp 2 --devices 0,1 --host 127.0.0.1 --port 8091 \
 - fish 封装同步改：`ninfer-tp2-serve` / `ninfer-tp2-stop`
 - 参数**逐条沿用旧手册**（`--kv-dtype int8` / `--draft-tokens 3` / `--default-max-tokens 32768` 等依据见旧手册 §3）
 
-## 4. 实测（2026-10-08，引擎日志口径）
-
-| 项 | Coder390 rebuilt | 旧件（neroued v2） |
-|---|---|---|
-| 加载 | 7.9 s | ~10 s |
-| 上下文 / KV | **262,144**（原生上限）· 4.81 GiB，余 215.75 MiB | 253,952 · 4.67 GiB（旧档，余 357.75 MiB） |
-| 冷 prefill（27,281 tok） | **3,033 tok/s** | 3,226（−6%） |
-| decode（长输出） | **101.5 tok/s** | 108.6（−6.5%） |
-| MTP | 3.45 tok/轮 · **81.7%** | 3.55 · 84.8% |
-| 100K 捞针（188,160 tok） | prefill 1,290 · **命中** | — |
-| 同 prompt 重发 | cache 6150/6152 · ttft **38 ms** | 37 ms（**A/B 逐项一致**） |
-| 经 8099 冷启动 | **8.27 s** → `finish=stop` | ~8.5 s |
+> 📦 折叠：§4 实测（2026-10-08 旧本机重打包件 · 引擎日志口径）→ 旧版本实录 [[_archive/qwen3.8-27b-coder390-tp2-ninfer_manifest-版本文史-20261014.md|qwen3.8-27b-coder390-tp2-ninfer_manifest-版本文史-20261014.md]]（关键数字：加载 7.9s；冷 prefill 3,033 tok/s；decode 101.5 tok/s；MTP 81.7%；同 prompt 重发 cache 6150/6152、ttft 38ms；现役上游件口径见 §9）
 
 ## 5. 质量 A/B（同端口、同参数、只换模型件）
 
@@ -148,4 +139,4 @@ sha256sum .../qwen3_8_27b_coder390_w4a4w8a8_v2_rebuilt.ninfer    # 期望 db0c7d
 
 **已知边界**：(a) 贪婪（`temperature=0`）路径已修复并有用例覆盖；(b) DFlash 两条道未验（tp2 上 DFlash 被拒、产线不可达）；(c) 多 lane（`--max-concurrency>1`）掩码隔离未验（产线固定 1）；(d) `tests/targets/qwen3_6/test_frontend.cpp` 目标既有坏（硬编码作者路径 `/home/neroued/…`，本机不可跑）。
 
-**来源**：隔离克隆 `~/workspace/so-port-20261013/repo`（分支 `so-port-structured-output`，已 ff 并入生产树）；移植地图/坑/验收口径见 skill `ninfer-linux-sm120a-build/references/constrained-decoding-port.md`。
+**来源**：隔离克隆 `~/workspace/so-port-20261013/repo`（分支 `so-port-structured-output`，已 ff 并入生产树）；移植地图/坑/验收口径见 skill `ninfer-linux-sm120a-build/references/constrained-decoding-port.md`。 （该隔离克隆已清理）

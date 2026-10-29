@@ -6,7 +6,7 @@ description: "NInfer 自研推理引擎在本机（MAXSUN B850 / Ryzen 7 9700X /
 trust: agent-generated
 status: current
 okf_version: v0.2
-timestamp: "2026-10-10"
+timestamp: "2026-10-21"
 sources:
   - 源码 ~/ninfer-build/src-5258/swift15/engine（commit 组合版 3c26089 = 基线 927e19e + 摘入 209c75b 的 serve 层；历史 c9fd230）
   - 本机会话实测（2026-10-03 ~ 10-04）
@@ -42,7 +42,7 @@ sources:
 | 内存 / 交换 | 59 GiB / 40 GiB swap |
 | CUDA | 系统 13.4.2（给 llama.cpp/vLLM）；**引擎本机自编用 `/usr/local/cuda`** |
 | 驱动 | 615.71.09 + aikitoria P2P 补丁（hold，只能随补丁 DKMS 一起升） |
-| 内核 | `7.2.9-gulong`（运行中） |
+| 内核 | **`7.3.0-9-generic`**（apt HWE，**2026-10-21 实测唯一在跑内核**；DKMS 也只对这一项 installed —— 自编 vanilla 7.3.0 随 2026-10-20 重装消失） |
 
 > [!warning] 关键前提
 > 引擎源码**原生只支持 RTX 30/40**（作者 README 原文：「只支持 RTX 30 / 40 系：引擎按 sm_86 编译。
@@ -56,7 +56,7 @@ sources:
 
 | 线 | 仓库 | 定位 |
 |---|---|---|
-| **本机现役** | `5258MF/ninfer-rtx3060-27b` → `swift15/engine/` | **完整源码** + **KVMem 已合入** + 架构门接受 `120a`，Apache-2.0 |
+| **本机现役（2026-10-21 换基座，见 §14）** | ~~`5258MF/ninfer-rtx3060-27b` → `swift15/engine/`~~ → 现为 `iamwavecut/ninfer-all@08fd7019` + `qzshch/ninfer-kvmem` 环（树 `~/ninfer-build/kvmem-base-20261021`） | **完整源码** + **KVMem 已合入（现以独立 `kvmem/` 模块接入）** + 架构门接受 `120a`，Apache-2.0 |
 | 上游汇总 | `iamwavecut/ninfer-all` | 多派系整合（3090/4090/5090/Blackwell），`master` = 0.12.0 |
 | RTX50 官方 | `Ryan-gsq/ninfer-16g-5070ti-5080-5090-…` | Windows / 16GB / RTX 50；**无 KVMem 环**（只有上游前缀缓存） |
 | 原始引擎 | `Neroued/ninfer` | 上游源头（Linux、sm_120a、无多卡、无环） |
@@ -75,14 +75,14 @@ sources:
 
 | 树 | 来源 | 源码命中 | 文件名含 kvmem | 结论 |
 |---|---|---|---|---|
-| **`src-5258`** | `5258MF/ninfer-rtx3060-27b` | **101** | **41** | ✅ **唯一带环** → 现役 |
+| **`src-5258`** | `5258MF/ninfer-rtx3060-27b` | **101** | **41** | ✅ **唯一带环** → 曾是唯一选择；**2026-10-21 起改跟环上游 `qzshch`（见 §14）**，本树保留作回滚 |
 | ~~`src`~~（**已删除** 2026-10-13） / `src-master` | `iamwavecut/ninfer-all`（2 个 checkout；`src` 为 09-23 旧 checkout，已删除、公开仓可重克隆） | 0 | 0 | 无环（仅上游前缀缓存） |
 | `src-tp2` | `wamansou/ninfer-tp2-1m` | 0 | 0 | 无环 ＋ 硬编码禁用前缀复用（不适合 agent 多轮） |
 | `baiyouqing-tp2` | `BaiYouQing/ninfer-tp2-5060ti-windows` | 0 | 0 | 无环 ＋ Windows 端 |
 | `patch-mirror` | （无 origin，本地） | 16 | 0 | 旧 KVMem 补丁镜像，非 fork 候选 |
 | `disk-kv-tier` / `runtime.orig-153116` | （无 origin，本地） | 0 | 0 | 实验 / 备份树 |
 
-**推理链**：要「单卡 256K」⇒ 必须把 KV 搬出显存并按需召回 ⇒ 必须**有环**；环不在上游汇总线、不在原始引擎（`Neroued/ninfer`）、不在 Windows 官方线（`Ryan-gsq`，§2.1 表已注「无环」）⇒ **只剩 5258**。
+**推理链**：要「单卡 256K」⇒ 必须把 KV 搬出显存并按需召回 ⇒ 必须**有环**；环不在上游汇总线、不在原始引擎（`Neroued/ninfer`）、不在 Windows 官方线（`Ryan-gsq`，§2.1 表已注「无环」）⇒ **只剩 5258**。（**2026-10-21 更新**：环的上游 `qzshch/ninfer-kvmem` 已把环做成独立 `kvmem/` 模块并持续更新，现役基座直接取自它 —— 见 §14；5258 自 10-13 停更。）
 
 **这条 fork 自己的定位正好对口**（`README.md` 原文）：标题「**ninfer：在 RTX 3060 上本地运行 27B 模型**」；「支持对话和图片输入，也支持工具调用与 **KVMem 长上下文**」；「Swift 1.5 默认总上下文为 **200K，最多可配置 256K**；**KVMem 会从历史中选取部分内容放入显存**」。环是它作者在持续开发的主线：`d161410` Allocate KVMem windows from rendered request prefixes / `f7090b9` perf(bonsai): move KVMem retrieval to CPU and allocate full resident windows / `c03e301`·`2d4f48e`·`274d060` 12GB 档 KVMem 容量调优。
 
@@ -115,7 +115,7 @@ third_party/ggml-quants        28 文件（仅量化：ggml-common.h / mmq.cuh /
 
 | 项 | 值 |
 |---|---|
-| 源树 | `~/ninfer-build/src-5258/swift15/engine/`（**2026-10-12 实测**：生产分支 `upgrade-013-20261005` @ **`c7f5a1b`** = `origin/main`（`7fdbbb7`）**+ 2 条本地移植的上游修复**（本机 fork 的本地提交，非来自 origin）；工作区干净。实验分支保留：`endpoint-anchor-20261012`（`e88e2b5`，端点锚移植，未采用）、`upstream-cache-fixes-20261012`（`c0bb9ae`）） |
+| 源树（**旧，2026-10-21 起生产改用 `~/ninfer-build/kvmem-base-20261021`，见 §14**） | `~/ninfer-build/src-5258/swift15/engine/`（**2026-10-12 实测**：生产分支 `upgrade-013-20261005` @ **`c7f5a1b`** = `origin/main`（`7fdbbb7`）**+ 2 条本地移植的上游修复**（本机 fork 的本地提交，非来自 origin）；工作区干净。实验分支保留：`endpoint-anchor-20261012`（`e88e2b5`，端点锚移植，未采用）、`upstream-cache-fixes-20261012`（`c0bb9ae`））。**⚠️ 永不对 `origin/main` 做 `merge --ff`**（2026-10-13 实测：上游 `78b2544e` 虽名为懒人包发布，但在引擎子树上把上面两处修复**逐字回退** —— `git diff c0bb9ae^ 78b2544e` 在这 2 个文件上为空；`rev-list origin/main..HEAD -- swift15/engine` = **1**，正是这处移植） |
 | 构建配置 | `CMAKE_CUDA_ARCHITECTURES=UNINITIALIZED=120a` · `CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc` · Release |
 | 二进制 | `build/apps/ninfer-serve`（**2026-10-12 23:13 重编换件**：源 = 生产分支 `upgrade-013-20261005` @ **`c7f5a1b`**（= `7fdbbb7` **+ 2 条本地移植的上游 context-cache 修复**：`e4cbf1e2` 抛错→优雅阻塞 + 满池 retain、`7649ce34` 独占锚额度守卫），sha256 **`f6c8b6bea627e76356eb16f87b9326af03c7f467`**，启动横幅 `build bonsai2-v0.1.5-2-gc7f5a1b`。**换件验收（实测）**：启动参数行（`KVMem allocation` / `context cache`）与产线日志**逐字相同**；复用回归**逐项与旧件相同**（工具 6,752/6,803、同文重发 6,649、冷启动 0）⇒ §9/§10 性能与容量档案不受影响（改动只在错误路径/保留决策/额度计数）。**上一代**（2026-10-10 登记、2026-10-12 23:13 退役）：编自 `5bb1516`，mtime `2026-10-05 22:47`，sha256 `d468690125ede9736e38beebc3805a83d3b97e63c5220e1420b923203d0bcfd7`，横幅 `build bonsai2-12g-v0.1.4`（该件的回滚副本 = `~/vault-backup/ninfer-binary-pre-upstream-fixes-20261012/ninfer-serve`）。**旧登记值「组合版 sha256 `8d793703103a38a4…`」已被取代** —— 10-04 组合版原物已迁 NAS 留档、本地已删除） |
 | 架构实证 | `cuobjdump --list-elf` → `device_calibration.sm_120a.cubin` 等；`strings` 701 处 `sm_120a` |
@@ -744,7 +744,8 @@ NInfer 的价值在**单卡 KVMem 环**（§10.1），不在双卡配置。
 ### 产物位置
 
 ```
-引擎源码   ~/ninfer-build/src-5258/swift15/engine/     (upgrade-013-20261005 @ c7f5a1b = origin/main + 2 条本地上游修复)
+引擎源码   ~/ninfer-build/kvmem-base-20261021/        (iamwavecut@08fd7019 + qzshch 补丁 + kvmem/ 模块；2026-10-21 起)
+旧树       ~/ninfer-build/src-5258/swift15/engine/     (upgrade-013-20261005 @ c7f5a1b，保留回滚)
 二进制     …/build/apps/ninfer-serve                   sha256 f6c8b6bea627e76356eb16f8… (生产分支 c7f5a1b = 7fdbbb7 + 2 条上游修复, 10-12 23:13)
 权重       ~/models/qwen3.8-27b-swift/swift-qwen38-rco-iq3s.ninfer   13.98 GiB
 启动       ~/models/qwen3.8-27b-swift/start-prod.sh
@@ -794,7 +795,7 @@ QUAL/LADDER JSON 与前缀复用 A/B；`ninfer-eval/` 引擎改动记录）。
 **两条引擎线**
 | 线 | 上游仓 | 本地 | 上游当前 | 判定 |
 |---|---|---|---|---|
-| 5258（8090 Swift） | `5258MF/ninfer-rtx3060-27b` | checkout `7fdbbb7`（= origin/main） | `7fdbbb7`（2026-10-06，其后无提交） | **无更新**（引擎子树 0 改动） |
+| ~~5258（8090 Swift）~~ | ~~`5258MF/ninfer-rtx3060-27b`~~ | checkout `7fdbbb7` | 停更 **2026-10-13** | **2026-10-21 起不再跟（改跟 qzshch，见 §14）** |
 | TP2（8091 Coder390） | `BaiYouQing/ninfer-tp2-5060ti-windows` | `windows-port` `c50ccc91` | `c50ccc91`（2026-09-24，无其它远端分支） | **无更新** |
 
 **两个在役生产模型件**（Ornith 件 2026-10-11 迁 NAS 退役）
@@ -804,45 +805,49 @@ QUAL/LADDER JSON 与前缀复用 A/B；`ninfer-eval/` 引擎改动记录）。
 | ~~`Ornith-1.5-35B-A3B-MTP-...v3.ninfer`~~ | 22,791,106,048 B / `e56ef1ec6ca085a48fe5076941b73177f65308c70e8cc311c4033b940ff5669e` | `knoopx/Ornith-1.5-35B-A3B-NInfer` | **2026-10-11 退役（迁 NAS）** |
 | `qwen3_8_27b_coder390_w4a4w8a8.ninfer` | 21,490,955,393 B / `e15f02938b69be2b87afb5e89a282772c4663674e703b3f17e099bba92f1b534` | 见 [[20_Tech_Stack/qwen3.8-27b-coder390-tp2-ninfer_manifest\|Coder390 手册 §9]]（`nerkyor/…-NVFP4-NInfer` 的 `…MTP-NInferV2.ninfer`） | **2026-10-11 换用上游件**（旧本机重打包件 `db0c7df8…` 归档 NAS） |
 
-## 📅 2026-10-12 单卡线（8090 · NInfer 5258 KVMem）当日工作记录
-
-> 本日全部工作围绕 **跨请求前缀复用**。产出 = **2 项生产改动（均已上线）** + **1 项实测否定（端点锚）** + **1 项选型定案**；**其余全部未动**（TP2/Strata 两线、其它参数）。细节块分布在 §2.1.1 / §2.3 / §6.5 / §10.1–10.2 / §11 pitfall #17。
-
-**① 复用的真实边界（实测，产线参数）**
-
-| 场景 | 结果 |
-|---|---|
-| 同文重发 / 纯文本多轮增长 | ✅ 99%+ |
-| **真实工具调用往返 + 下一轮**（Hermes 主形态） | ✅ **99.2% / 99.7%**（标签 `turn closure` / `response replay`） |
-| **兄弟分叉**（同一处换问法 ≈ 重新生成 / 改最后一条消息） | ❌ **0** —— 唯一缺口，**已判不做** |
-
-- 缺口归因（插桩实测）：端点锚闸门 `matched_prefix_tokens(owner, prompt) < endpoint` 恒拒，而 `endpoint` 记的是**整段已执行续写的 frontier（含客户端不回传的隐藏推理 token）**；定量 `6715 − 6652 = 63` ≈ 被剥掉的 62 个推理 token。
-- 行业同题（本日查证）：**Anthropic** —— 开 thinking 时推理块必须逐字回传（*"must be passed back verbatim"*）；**vLLM issue #39321** —— 推理 token 污染前缀缓存（不可达条目）。主流 APC 建在**输入前缀**上，故天然免疫。
-- ⚠️ **本日作废的两条旧结论**：① 「工具调用后不复用」= **测试假象**（手工编造的工具历史；且其中一轮**混用了思考开关**，而换思考配置本身即失效）；② 「Hermes 每一轮都触发该限制」= **错**。
-
-**② 生产改动 ①（已上线）：`--derive-session-keys`**
-`~/models/qwen3.8-27b-swift/start-prod.sh` 加一行。KVMem 窗口模式下会话键只在该 flag 打开时派生（`serve_options.h` 默认 false）。实测：同 prompt 连发 `4.6k 4.2s→0.3s`、`72k 75.4s→0.33s`、`134k 149.8s→0.31s`（**478×**）。代价：复用令 `temperature=0` 不可复现（质量 A/B 需 nonce 或临时关复用）。细节见 §6.5。
-
-**③ 生产改动 ②（已上线，2026-10-12 23:13 换件）：2 条上游 context-cache 修复**
-`e4cbf1e2`（`throw "Program rejected isolated root planning"` → 优雅 `TemporarilyBlocked`；私有源 retain 规则补 `!publish_continuation || declares_boundary_here`）+ `7649ce34`（锚额度循环补 `!state_exclusive_to_sequence` 守卫；上游称缺它会抛 entitlement 错并**闩死引擎**）。共 **2 文件 +24/−4**，编译通过，**回归逐项与旧件相同**（冷启动 0/0、同文重发 6,649、工具 6,752 / 6,803）⇒ **无实测收益、无回归**，价值在健壮性。出货件见 §2.3「二进制」行（sha `f6c8b6be…`，横幅 `build bonsai2-v0.1.5-2-gc7f5a1b`）。
-
-**④ 实测否定（负结果，勿重复踩）**
-
-| 项 | 结论 |
-|---|---|
-| 上游端点锚 `ca0c2afd`（本 fork 移植后） | **惰性**：编译通过、单测 11/12，但运行时**一个锚都不铸造**（断点见 ①） |
-| `--auto-long-anchors` / `--max-private-continuations 4` / `--device-state-slots 3` / `--preserve-thinking` | 同脚本 A/B **逐项相同**，四个开关均无收益 |
-| 上游崩溃修复 `f928d888` | 本 fork **早有** `if (!index.shared)` 守卫 ⇒ 无可移植 |
-| 「关思考以换复用」 | 用户否决（代价过大）；正确做法是**回传推理**（Anthropic 路线）或**引擎把推理排除出缓存**（vLLM 路线） |
-
-**⑤ 产出物 / 回滚**
-- 分支（本地，未推送）：`endpoint-anchor-20261012`（`e88e2b5`，端点锚移植，**未采用**）、`upstream-cache-fixes-20261012`（`c0bb9ae`，**已并入生产分支**）
-- 回滚件：`~/vault-backup/ninfer-binary-pre-upstream-fixes-20261012/ninfer-serve`（旧件 `d468690125ede973…`）、`~/vault-backup/ninfer-binary-pre-endpoint-anchor-20261012/`
-- 探针与日志（按规则都在 `~/workspace/`）：`verify-fixes.py`、`toolgrowth.py`、`sib3.py`、`xcontrol.py`、`anchor-dbg/`（4 份实测日志）
-
-> **2026-10-13 补注（产物清理，结论不变）**：按用户「没收益的话就都清了」——分支 `endpoint-anchor-20261012`（`e88e2b5`）已删（其内容 = 公开上游提交 `ca0c2afd` + 本机插桩，方法已落在 skill `ninfer-linux-sm120a-build` → `references/kvmem-upstream-lineage.md`）；`~/workspace/` 下 `verify-fixes.py`、`toolgrowth.py`、`sib3.py`、`xcontrol.py`、`anchor-dbg/`、`port/`、`port-result-20261012/`、`start-prod-{dbg,anchor,preserve,reuse-ab,P4,P4D2}.sh`、`upstream-endpoint-anchors.patch` 亦一并删除。同日另清：`68c5435`（模板裁剪保缓存边界）移植件全套（分支 `port-68c5435-20261013` @ `2fa34385` + 隔离 build 4.2 G）——**编译过、两单测绿、但与产线件 A/B 逐行相同（零收益）**，判据见上述 skill 参考 §7。**回滚件（`~/vault-backup/ninfer-binary-*`）保留未动。**
-
-**⑥ 选型定案**：见 §2.1.1 —— 「单卡 27B 长上下文 ⇒ 必须有环 ⇒ 本机只有 `5258MF` 这条 fork 带环」。
+> 📦 **折叠留档（2026-10-14）**：本页原「## 📅 2026-10-12 单卡线（8090 · NInfer 5258 KVMem）当日工作记录」（39 行过程流水）已整块逐字移入 [[20_Tech_Stack/_archive/ninfer_engine_architecture_manifest-版本文史-20261014|旧版本实录]]。关键数字：真实工具调用往返复用 **99.2% / 99.7%**（`turn closure` / `response replay`）、同文重发与纯文本多轮增长 **99%+**、兄弟分叉 **0**（唯一缺口，已判不做）；`--derive-session-keys` 上产后同 prompt 连发 4.6k `4.2s→0.3s`、72k `75.4s→0.33s`、134k `149.8s→0.31s`（**478×**）；2 条上游 context-cache 修复 2 文件 +24/−4（**无实测收益、无回归**，价值在健壮性）；负结果：上游端点锚移植后**惰性**、`--auto-long-anchors`/`--max-private-continuations`/`--device-state-slots`/`--preserve-thinking` 四开关无收益、`f928d888` 本机早有、「关思考以换复用」被用户否决。**why 不受影响**：选型定案见 §2.1.1，复用机制/根因/行业依据见 §6.5，生产参数见 §10.1–10.2，坑见 §11 #17。
 
 > **本机 Swift 件的性质（§13 补注，不属上面当日记录）**：目录内**无 HF 下载缓存**，且包内 provenance 记录为「`converter: ninfer-v3` + `base`/`gguf`/`vision`/`dflash2` 四路输入（B 机 `E:\infer-build\…` 路径）」⇒ 它是**从源 GGUF+mmproj 转换出的 v3 件，不是 HF 直下件**。HF 上名称最接近的两件尺寸都对不上（`fyb1214/…-IQ3_S-mtp` 12,790,639,360 B；`WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3` 15,017,456,**896** B，比本机件多 **768 B**）。
 > **溯源方法（可复用）**：HF 直下件的来源可从 `~/models/<pkg>/.cache/huggingface/download/*.metadata` 读出三行 = **revision / LFS sha256 / 下载时间戳**；仓名从 `~/.cache/huggingface/hub/models--<org>--<name>/refs/main` 反查（其内容 ≡ 同一 revision）。**判「有无更新」一律比对 sha256 与 revision，不信文件名相似度。**
+
+## §14 换基座：8090 从「5258 下游移植树」切到「qzshch 环上游」（2026-10-21，用户决定）
+
+**为什么切**：5258 自 2026-10-13 停更，而环的真实上游 `qzshch/ninfer-kvmem` 仍在动（10-20 前仍有 RAM KV 预取、bounded recall transfer、DFlash2 八通道等提交）。决策口径见 §2.1.1 谱系：`Neroued`（基座）→ `qzshch`（环）→ `5258`（移植进新引擎结构）。选择「直接以上游为底座」，接受性能代价，不再在老树上打补丁。
+
+**怎么搭的（可复现）**：
+1. 基座 = `iamwavecut/ninfer-all` **`08fd7019`**（worktree：`~/ninfer-build/kvmem-base-20261021`）
+2. 补丁 = `qzshch/ninfer-kvmem` 的 `backends/patches/ninfer-kvmem.patch`（1.2 MB / 208 文件 / 740 hunk，sha256 `d1b64eb…` 与仓内 `versions.json` 声明一致）→ **在真基座上 208 文件全部干净应用（0 reject）**
+3. 外部模块 = 同仓 `kvmem/`（56 文件 / 443 KB）→ `cmake -DNINFER_KVMEM_SOURCE_DIR=<path>/kvmem`
+4. 编译：`-DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`（**nvcc 不在 PATH，必须显式给编译器**，否则 configure 失败）；819 目标全绿
+5. 生产二进制 sha `169716d5…`（643,752,688 B）；启动器 `~/models/qwen3.8-27b-swift/start-prod.sh` 已重写，旧版 `start-prod.sh.5258-20261021`
+
+**参数映射（旧 → 新）**：
+| 旧（5258） | 新（qzshch 基座） |
+|---|---|
+| `--kvmem-window-pages 1000` | `--kvmem-budget 61440` + `--kvmem-gen-reserve 4096`（窗口 = B+R = 65,536） |
+| `--host-kv-mib 16384` | `--kvmem-host-mib 16384`（上下文缓存归 KVMem 独占，旧键不再生效） |
+| sink 2 页（env `NINFER_KVMEM_SINK_PAGES=2`） | `--kvmem-sink-tokens 128` |
+| `NINFER_KVMEM_AUTO_ALLOCATION/_LONG_REUSE` 等 4 个 env | 无对应（新基座用 `--kvmem-*` 旗标） |
+| `--kv-capacity auto` | **删掉**（有 KVMem 时被「B+R ≤ capacity」闸门拒） |
+| `--device-state-slots 1` | **删掉**（会触发「exclusive ownership of history caching」拒绝） |
+| `--embedding-host`、`--lm-head-q6` | 新基座无此旗标 |
+
+**性能对照（同题、temp 0、seed 7、同工件、单卡）**：
+| 场景 | 5258（旧） | qzshch 基座（新） |
+|---|---|---|
+| 短题 decode | **67.2 tok/s**（草稿 39/84=46.4%） | 51.0（37/108=34.3%） |
+| 散文 512 / 1024 tok | 60.5 / 64.1 | 51.0 / 51.0 |
+| 7,457 tok 长文 | prefill 1.13k / decode 66.8 | prefill 1.10k / decode 64.5 |
+| 工具调用 | prefill 756 / decode 71.2 | prefill 547 / decode 73.9 |
+| 前缀复用 | 91.5%（TTFT 75.7 ms） | **98.3%（TTFT 64.5 ms）** |
+| 关掉 KVMem 的裸引擎 | — | 54.0 ⇒ **慢在引擎核心而非 KVMem** |
+
+- 参数扫描无法弥补：`draft 3` 51.8、`--adaptive-mtp`(d4) 50.2、(d8) 42.8、`d6` 42.3、`d8` 35.9、`--full-draft-head` 47.7、`--kvmem-budget 32768` 51.0；`--draft-min-p` 与 `--expert-cache-adaptive` 直接启动失败。
+- **差距定位**：`execution/mtp.cpp|mtp.h`、`ops/mtp_round.h`、`ops/mtp_pack.h` 两树**逐字相同（0 行差异）**；差异在草稿宽度策略层（5258 独有 `program/speculative/mtp_adaptive.h` 406 行，被 `program_impl.h` include）与验证器（qzshch 反而已升级为 `speculative_accept_coupled_drafts`，5258 仍是 greedy）。**未移植**（用户决定「不调试了」）。
+
+**校准（2026-10-21 13:12 已完成）**：新基座要求 `schema_version: 2` 的 device profile（旧文件是 5258 系 v1 ⇒ 被跳过）。用 `ninfer-calibrate --device 0` 重跑：**78 keys / 63.3 s / 其中 50 个键改走非编译路径**，写入 `~/.cache/ninfer/device-profiles.json`（`origin: ninfer-calibrate on NVIDIA GeForce RTX 5060 Ti`，route catalog `5893cf72e3d60377`）；旧 v1 文件备份在 `~/vault-backup/ninfer-8090-pre-rebuild-20261021/device-profiles.v1-5258.json`。引擎启动告警消失，日志改为 `device profile … 78 routed keys`。**校准后 decode：短题 51.0 → 53.0、散文 512 tok 51.0 → 51.2**（+2 / +0.4），仍比旧线 67.2 低 —— 校准只补回 2 tok/s，主差距仍是草稿宽度策略。GPU1 未校准（KVMem 单卡线只用卡 0；如 8091 也换新基座再校准）。
+
+**已知遗留**：decode 比旧线低 24%（散文），如将来要追，切入点是把 `mtp_adaptive.h` 接到新验证器上，先看能否把接受率从 34.3% 拉回 46.4%。
+
+**回滚**：`cp ~/models/qwen3.8-27b-swift/start-prod.sh.5258-20261021 ~/models/qwen3.8-27b-swift/start-prod.sh`，二进制用 `~/vault-backup/ninfer-8090-pre-rebuild-20261021/ninfer-serve.pre`（sha `f6c8b6be…`）。旧树 `~/ninfer-build/src-5258` 与 `git bundle`（`~/vault-backup/ninfer-8090-pre-rebuild-20261021/tree-514803c8.bundle`）都在。
+

@@ -5,7 +5,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/ubuntu/.local/bin/ninfer-router --profile strata
+ExecStart=/home/mmknet/.local/bin/ninfer-router --profile strata
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1

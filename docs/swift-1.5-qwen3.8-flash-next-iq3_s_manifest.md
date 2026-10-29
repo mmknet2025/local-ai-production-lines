@@ -48,9 +48,11 @@ sources:
 | 正常模式（默认 resident arena，去掉 `--resident-experts`） | 46.84 GiB | ~11 GiB | ~3 GiB | ~87 tok/s |
 
 - **59 GiB 机器两模式都能跑** ⇒ `--resident-experts` **非必需**（安装器「需 ~62 GB」估计偏保守）。正常模式快 ~10% 但仅余 ~3 GiB；低 RAM 模式余量足、更稳，故为默认。
-- **校准**（`tools/calibrate.py`，592 s）得 **`--pcie-frac 0.20`**（引擎自探 0.55）、**`--spec-min-p 0.70`**，受控 3 轮扫描 **+6.7%**。
-- 生效 args：`kv k8v4` / `max-context 262144` / `spec 6` / `mtp-max-t 4` / `suffix-draft 3` / `trim-stage-weights` / `vram-reserve-mib 700` / `pipeline-windows 2` / `layer_split 24` / `--resident-experts`。
+- **校准**（`tools/calibrate.py`，592 s）得 **`--pcie-frac 0.20`**（引擎自探 0.55；**0.1.44 已删该 flag，改自动**）、**`--spec-min-p 0.70`**，受控 3 轮扫描 **+6.7%**。
+- 生效 args：`kv k8v4` / `max-context 262144` / `spec 6` / `mtp-max-t 4` / `suffix-draft 3` / `trim-stage-weights` / `pipeline-windows 2` / `layer_split 24` / `--resident-experts`。
 - opt-in 实测（`STRATA_EXCHANGE_ROTATE` / `STRATA_DISJOINT_ADAPT` / `--lookup-chain` / `--mtp-q4`）：**均无收益或本机不适用**，未采纳。
+- **2026-10-14（v0.1.44）复核**：`--mtp-q4 all` 以 9 轮配对复测（n=8 符号秩）**仍无收益**（decode +2.00，p=0.294），并补到机制证据 —— 草稿头每步读 **212.9 → 146.0 MiB**（−31%）但**显存余量不变**（仍 335/210 MiB），草稿接受率 81.1%→78.7%（−2.4pt）与增益相抵。`--adapt-async 1`（本机有 `--resident-experts` ⇒ 该开关有效）实测 decode +1.40（p=0.53）、prefill −2.50（7/8 更慢，p=0.059）⇒ **也不用**。
+- **同步**：`--pcie-frac` 与 `--vram-reserve-mib` 在 **0.1.44 已从二进制删除**；本机协议检测下限 ≈5%（同一配置独立跑两次中位差 −4.60 tok/s）。
 
 ## 四、为何从 IQ3_XXS 换到 IQ3_S（2026-10-11）
 - IQ3_XXS 手册当年的结论「Strata 的 Swift **无 IQ3_S** 档」**已被推翻**：Swift 1.5 自 2026-10-08 起有 IQ3_S（`ukisai/...` 仓，上游 #1651）。
